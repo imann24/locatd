@@ -1,24 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import type { RealtimeChannel, Session } from '@supabase/supabase-js'
-import { divIcon, type LatLngTuple } from 'leaflet'
-import {
-  MapContainer,
-  Marker,
-  Popup,
-  TileLayer,
-  useMap,
-  useMapEvents,
-} from 'react-leaflet'
+import type { LatLngTuple } from 'leaflet'
+import { AuthForm } from './components/AuthForm'
+import type { MapMarker } from './components/MapCanvas'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 
-type MarkerModel = {
-  id: string
-  name: string
-  position: LatLngTuple
-  role: 'test-user' | 'self' | 'friend' | 'pin'
-  lastSeenAt?: string
-}
+const LazyMapCanvas = lazy(async () =>
+  import('./components/MapCanvas').then((module) => ({
+    default: module.MapCanvas,
+  })),
+)
+
+type MarkerModel = MapMarker
 
 const DEFAULT_CENTER: LatLngTuple = [37.7749, -122.4194]
 const STALE_AFTER_MS = 90_000
@@ -99,36 +93,12 @@ type BroadcastLocationPayload = {
   name?: string
 }
 
-function MapRecenter({ center }: { center: LatLngTuple }) {
-  const map = useMap()
-
-  useEffect(() => {
-    map.flyTo(center, map.getZoom(), { duration: 0.7 })
-  }, [center, map])
-
-  return null
+function formatTimestamp(timestampIso: string) {
+  const date = new Date(timestampIso)
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
-function createMarkerIcon(role: MarkerModel['role']) {
-  const iconClass =
-    role === 'self'
-      ? 'marker marker-self'
-      : role === 'friend'
-        ? 'marker marker-friend'
-        : role === 'pin'
-          ? 'marker marker-pin'
-        : 'marker marker-test-user'
-
-  return divIcon({
-    className: iconClass,
-    iconSize: role === 'pin' ? [16, 16] : [20, 20],
-    iconAnchor: role === 'pin' ? [8, 8] : [10, 10],
-    popupAnchor: [0, role === 'pin' ? -10 : -12],
-  })
-}
-
-function formatLastSeen(lastSeenAt: string | undefined, nowMs: number) {
-  if (!lastSeenAt) return 'Last seen unknown'
+function formatLastSeenText(lastSeenAt: string, nowMs: number) {
   const elapsedMs = nowMs - new Date(lastSeenAt).getTime()
   if (elapsedMs < 15_000) return 'Live now'
   const seconds = Math.floor(elapsedMs / 1000)
@@ -139,27 +109,6 @@ function formatLastSeen(lastSeenAt: string | undefined, nowMs: number) {
   return `Seen ${hours}h ago`
 }
 
-function formatTimestamp(timestampIso: string) {
-  const date = new Date(timestampIso)
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-}
-
-function MapTapCapture({
-  enabled,
-  onTap,
-}: {
-  enabled: boolean
-  onTap: (position: LatLngTuple) => void
-}) {
-  useMapEvents({
-    click(event) {
-      if (!enabled) return
-      onTap([event.latlng.lat, event.latlng.lng])
-    },
-  })
-
-  return null
-}
 
 function App() {
   const [session, setSession] = useState<Session | null>(null)
@@ -353,7 +302,7 @@ function App() {
       .map((row) => ({
         id: `checkin-${row.user_id}`,
         title: `${nextNameMap[row.user_id] ?? 'Friend'} checked in`,
-        detail: formatLastSeen(row.last_seen_at, Date.now()),
+        detail: formatLastSeenText(row.last_seen_at, Date.now()),
         at: row.last_seen_at,
       }))
 
@@ -863,90 +812,21 @@ function App() {
 
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-slate-900 text-slate-100">
-      <MapContainer
-        center={center}
-        zoom={13}
-        scrollWheelZoom
-        className="h-full w-full touch-pan-x touch-pan-y"
-      >
-        <TileLayer
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+      <Suspense fallback={<div className="h-full w-full bg-slate-800" />}>
+        <LazyMapCanvas
+          center={center}
+          markers={userMarkers}
+          pins={pins}
+          nowMs={nowMs}
+          staleAfterMs={STALE_AFTER_MS}
+          canDropPin={Boolean(session?.user)}
+          reactionCounts={reactionCounts}
+          onMapTap={handleMapTap}
+          onReactToPin={(pinId, emoji) => void handleReactToPin(pinId, emoji)}
+          getDisplayName={getDisplayName}
+          formatTimestamp={formatTimestamp}
         />
-        <MapRecenter center={center} />
-        <MapTapCapture enabled={Boolean(session?.user)} onTap={handleMapTap} />
-        {userMarkers.map((marker) => (
-          <Marker
-            key={marker.id}
-            position={marker.position}
-            icon={createMarkerIcon(marker.role)}
-          >
-            <Popup>
-              <div className="space-y-1 text-sm">
-                <p className="font-medium">{marker.name}</p>
-                {marker.role !== 'test-user' ? (
-                  <p className="text-slate-500">
-                    {formatLastSeen(marker.lastSeenAt, nowMs)}
-                    {marker.lastSeenAt &&
-                    nowMs - new Date(marker.lastSeenAt).getTime() > STALE_AFTER_MS
-                      ? ' (stale)'
-                      : ''}
-                  </p>
-                ) : null}
-              </div>
-            </Popup>
-          </Marker>
-        ))}
-        {pins.map((pin) => (
-          <Marker
-            key={`pin-${pin.id}`}
-            position={[pin.lat, pin.lng]}
-            icon={createMarkerIcon('pin')}
-          >
-            <Popup>
-              <div className="w-52 space-y-2 text-sm">
-                <p className="font-medium">{getDisplayName(pin.user_id)}</p>
-                <p className="text-xs text-slate-500">{formatTimestamp(pin.created_at)}</p>
-                <p>{pin.emoji ?? '📍'} {pin.note ?? 'No note'}</p>
-                {pin.photo_url ? (
-                  <a
-                    className="text-xs text-blue-500 underline"
-                    href={pin.photo_url}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Open photo
-                  </a>
-                ) : null}
-                <div className="flex flex-wrap gap-1 text-xs">
-                  {Object.entries(reactionCounts[pin.id] ?? {}).map(([emoji, count]) => (
-                    <span
-                      key={`${pin.id}-${emoji}`}
-                      className="rounded bg-slate-800 px-2 py-1"
-                    >
-                      {emoji} {count}
-                    </span>
-                  ))}
-                </div>
-                {session?.user ? (
-                  <div className="flex gap-1">
-                    {['👍', '❤️', '😂'].map((emoji) => (
-                      <button
-                        key={`${pin.id}-react-${emoji}`}
-                        type="button"
-                        className="rounded bg-slate-700 px-2 py-1 text-xs"
-                        onClick={() => void handleReactToPin(pin.id, emoji)}
-                      >
-                        {emoji}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            </Popup>
-          </Marker>
-        ))}
-      </MapContainer>
+      </Suspense>
 
       <section className="pointer-events-none absolute inset-x-0 top-0 z-[500] p-3">
         <form
@@ -1217,64 +1097,26 @@ function App() {
               </button>
             </div>
           ) : (
-            <form className="mt-4 space-y-2" onSubmit={handleSignIn}>
-              <input
-                required
-                type="email"
-                className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
-                placeholder="Email"
-                value={email}
-                onChange={(event) => {
-                  setEmail(event.target.value)
-                  if (authError) setAuthError(null)
-                }}
-              />
-              <input
-                type="text"
-                className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
-                placeholder="Username (for sign up)"
-                value={username}
-                onChange={(event) => setUsername(event.target.value)}
-              />
-              <input
-                required
-                type="password"
-                className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
-                placeholder="Password"
-                value={password}
-                onChange={(event) => {
-                  setPassword(event.target.value)
-                  if (authError) setAuthError(null)
-                }}
-              />
-              {authError ? <p className="text-xs text-rose-300">{authError}</p> : null}
-              {authNotice ? <p className="text-xs text-emerald-300">{authNotice}</p> : null}
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  disabled={authLoading}
-                  type="submit"
-                  className="rounded-lg bg-blue-500 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
-                >
-                  Sign in
-                </button>
-                <button
-                  disabled={authLoading}
-                  type="button"
-                  className="rounded-lg bg-emerald-500 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
-                  onClick={() => void handleSignUp()}
-                >
-                  Sign up
-                </button>
-              </div>
-              <button
-                disabled={authLoading}
-                type="button"
-                className="w-full rounded-lg border border-slate-600 px-3 py-2 text-xs font-medium text-slate-200 disabled:opacity-50"
-                onClick={() => void handleForgotPassword()}
-              >
-                Forgot password
-              </button>
-            </form>
+            <AuthForm
+              email={email}
+              username={username}
+              password={password}
+              authError={authError}
+              authNotice={authNotice}
+              authLoading={authLoading}
+              onEmailChange={(value) => {
+                setEmail(value)
+                if (authError) setAuthError(null)
+              }}
+              onUsernameChange={setUsername}
+              onPasswordChange={(value) => {
+                setPassword(value)
+                if (authError) setAuthError(null)
+              }}
+              onSignIn={handleSignIn}
+              onSignUp={() => void handleSignUp()}
+              onForgotPassword={() => void handleForgotPassword()}
+            />
           )}
         </div>
       </aside>
