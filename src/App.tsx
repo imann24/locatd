@@ -133,6 +133,9 @@ function App() {
   const [friendshipRows, setFriendshipRows] = useState<FriendshipRow[]>([])
   const [searchUsersInput, setSearchUsersInput] = useState('')
   const [userSearchResults, setUserSearchResults] = useState<SearchUserRow[]>([])
+  const [searchUsersLoading, setSearchUsersLoading] = useState(false)
+  const [searchUsersStatus, setSearchUsersStatus] = useState<string | null>(null)
+  const [hasSearchedUsers, setHasSearchedUsers] = useState(false)
   const [friendStatus, setFriendStatus] = useState<string | null>(null)
   const [pins, setPins] = useState<PinRow[]>([])
   const [pinDraft, setPinDraft] = useState<PinDraft | null>(null)
@@ -151,6 +154,7 @@ function App() {
   const hasCenteredOnSelfRef = useRef(false)
   const drawerStartYRef = useRef<number | null>(null)
   const drawerDeltaYRef = useRef(0)
+  const latestUserSearchIdRef = useRef(0)
 
   const resetLocationState = () => {
     setSelfMarker(null)
@@ -160,7 +164,11 @@ function App() {
     setLocationStatus(null)
     setLocationVisible(true)
     setFriendshipRows([])
+    setSearchUsersInput('')
     setUserSearchResults([])
+    setSearchUsersLoading(false)
+    setSearchUsersStatus(null)
+    setHasSearchedUsers(false)
     setFriendStatus(null)
     setPins([])
     setPinDraft(null)
@@ -573,23 +581,71 @@ function App() {
     setAuthLoading(false)
   }
 
-  const handleSearchUsers = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    setFriendStatus(null)
-    if (!searchUsersInput.trim()) {
+  const executeUserSearch = useCallback(async (rawQuery: string) => {
+    const query = rawQuery.trim()
+    setSearchUsersStatus(null)
+    if (!query) {
       setUserSearchResults([])
+      setHasSearchedUsers(false)
+      return
+    }
+    if (query.length < 2) {
+      setSearchUsersStatus('Type at least 2 characters to search.')
+      setUserSearchResults([])
+      setHasSearchedUsers(false)
       return
     }
 
+    const searchRequestId = latestUserSearchIdRef.current + 1
+    latestUserSearchIdRef.current = searchRequestId
+    setHasSearchedUsers(true)
+    setSearchUsersLoading(true)
     const { data, error } = await supabase.rpc('search_users', {
-      query_text: searchUsersInput.trim(),
+      query_text: query,
     })
+    if (latestUserSearchIdRef.current !== searchRequestId) return
+    setSearchUsersLoading(false)
     if (error) {
-      setFriendStatus(error.message)
+      setSearchUsersStatus(error.message)
       return
     }
-    setUserSearchResults((data ?? []) as SearchUserRow[])
+    const results = (data ?? []) as SearchUserRow[]
+    setUserSearchResults(results)
+    setSearchUsersStatus(results.length === 0 ? 'No users matched that search yet.' : null)
+  }, [])
+
+  const handleSearchUsers = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    await executeUserSearch(searchUsersInput)
   }
+
+  useEffect(() => {
+    const query = searchUsersInput.trim()
+    if (!query) {
+      latestUserSearchIdRef.current += 1
+      setSearchUsersLoading(false)
+      setSearchUsersStatus(null)
+      setUserSearchResults([])
+      setHasSearchedUsers(false)
+      return
+    }
+    if (query.length < 2) {
+      latestUserSearchIdRef.current += 1
+      setSearchUsersLoading(false)
+      setSearchUsersStatus('Type at least 2 characters to search.')
+      setUserSearchResults([])
+      setHasSearchedUsers(false)
+      return
+    }
+
+    const timerId = window.setTimeout(() => {
+      void executeUserSearch(query)
+    }, 280)
+
+    return () => {
+      window.clearTimeout(timerId)
+    }
+  }, [searchUsersInput, executeUserSearch])
 
   const handleSendFriendRequest = async (targetUserId: string) => {
     if (!session?.user) return
@@ -1011,37 +1067,122 @@ function App() {
                 {poiStatus ? <p className="text-xs text-slate-400">{poiStatus}</p> : null}
               </div>
               <form className="space-y-2" onSubmit={handleSearchUsers}>
-                <input
-                  className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
-                  placeholder="Find users by name"
-                  value={searchUsersInput}
-                  onChange={(event) => setSearchUsersInput(event.target.value)}
-                />
-                <button
-                  type="submit"
-                  className="w-full rounded-lg bg-indigo-600 px-3 py-2 font-medium hover:bg-indigo-500"
-                >
-                  Search users
-                </button>
-              </form>
-              {userSearchResults.length > 0 ? (
-                <div className="max-h-24 space-y-1 overflow-y-auto rounded-lg bg-slate-900/70 p-2">
-                  {userSearchResults.map((user) => (
-                    <div
-                      key={`search-user-${user.id}`}
-                      className="flex items-center justify-between gap-2 text-xs"
+                <div className="rounded-lg border border-slate-700 bg-slate-900/80 p-2">
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
+                      placeholder="Search people by name or username"
+                      value={searchUsersInput}
+                      onChange={(event) => setSearchUsersInput(event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="rounded-lg bg-slate-700 px-2 py-2 text-xs hover:bg-slate-600"
+                      onClick={() => setSearchUsersInput('')}
                     >
-                      <span className="truncate">
-                        {user.full_name || user.username || 'User'}
-                      </span>
-                      <button
-                        type="button"
-                        className="rounded bg-blue-600 px-2 py-1"
-                        onClick={() => void handleSendFriendRequest(user.id)}
-                      >
-                        Add
-                      </button>
-                    </div>
+                      Clear
+                    </button>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
+                    <span>
+                      {searchUsersLoading
+                        ? 'Searching...'
+                        : hasSearchedUsers
+                          ? `${userSearchResults.length} results`
+                          : 'Start typing to discover people nearby'}
+                    </span>
+                    <button
+                      type="submit"
+                      className="rounded bg-indigo-600 px-2 py-1 font-medium text-slate-50 hover:bg-indigo-500"
+                    >
+                      Search
+                    </button>
+                  </div>
+                </div>
+              </form>
+              {searchUsersStatus ? (
+                <p className="rounded-lg bg-slate-900/70 px-2 py-1 text-xs text-amber-200">
+                  {searchUsersStatus}
+                </p>
+              ) : null}
+              {userSearchResults.length > 0 ? (
+                <div className="max-h-40 space-y-2 overflow-y-auto rounded-lg bg-slate-900/70 p-2">
+                  {userSearchResults.map((user) => (
+                    (() => {
+                      const isCurrentUser = user.id === session.user.id
+                      const linkedFriendship = friendshipRows.find(
+                        (row) =>
+                          (row.requester_id === session.user.id &&
+                            row.addressee_id === user.id) ||
+                          (row.requester_id === user.id &&
+                            row.addressee_id === session.user.id),
+                      )
+                      const relationshipLabel = isCurrentUser
+                        ? 'You'
+                        : linkedFriendship?.status === 'accepted'
+                          ? 'Friend'
+                          : linkedFriendship?.status === 'pending' &&
+                              linkedFriendship.requester_id === session.user.id
+                            ? 'Requested'
+                            : linkedFriendship?.status === 'pending'
+                              ? 'Requested you'
+                              : 'New'
+                      const canAddFriend =
+                        !isCurrentUser &&
+                        (!linkedFriendship ||
+                          (linkedFriendship.status === 'pending' &&
+                            linkedFriendship.requester_id !== session.user.id))
+                      const name = user.full_name || user.username || 'User'
+                      const handle = user.username ? `@${user.username}` : 'No username yet'
+                      const initials = name
+                        .split(' ')
+                        .filter(Boolean)
+                        .slice(0, 2)
+                        .map((part) => part[0]?.toUpperCase())
+                        .join('')
+                      return (
+                        <div
+                          key={`search-user-${user.id}`}
+                          className="rounded-lg border border-slate-700 bg-slate-900/80 p-2"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="truncate text-xs font-medium text-slate-100">{name}</p>
+                              <p className="truncate text-[11px] text-slate-400">{handle}</p>
+                            </div>
+                            <div className="rounded-md bg-slate-700/70 px-2 py-1 text-[10px] text-slate-200">
+                              {relationshipLabel}
+                            </div>
+                          </div>
+                          <div className="mt-2 flex items-center justify-between">
+                            <div className="flex h-7 w-7 items-center justify-center rounded-full bg-indigo-600/80 text-[11px] font-semibold text-white">
+                              {initials || 'U'}
+                            </div>
+                            <button
+                              type="button"
+                              className={`rounded px-2 py-1 text-[11px] font-medium ${
+                                canAddFriend
+                                  ? 'bg-blue-600 text-white hover:bg-blue-500'
+                                  : 'bg-slate-700 text-slate-300'
+                              }`}
+                              onClick={() => void handleSendFriendRequest(user.id)}
+                              disabled={!canAddFriend}
+                            >
+                              {isCurrentUser
+                                ? 'This is you'
+                                : linkedFriendship?.status === 'accepted'
+                                  ? 'Added'
+                                  : linkedFriendship?.status === 'pending' &&
+                                      linkedFriendship.requester_id === session.user.id
+                                    ? 'Pending'
+                                    : linkedFriendship?.status === 'pending'
+                                      ? 'Accept by tapping add'
+                                      : 'Add friend'}
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })()
                   ))}
                 </div>
               ) : null}
