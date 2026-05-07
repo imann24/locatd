@@ -167,6 +167,7 @@ function App() {
   const [password, setPassword] = useState('')
   const [username, setUsername] = useState('')
   const [authError, setAuthError] = useState<string | null>(null)
+  const [authNotice, setAuthNotice] = useState<string | null>(null)
   const [authLoading, setAuthLoading] = useState(false)
   const [searchInput, setSearchInput] = useState('')
   const [searchError, setSearchError] = useState<string | null>(null)
@@ -189,8 +190,11 @@ function App() {
   >({})
   const [activityFeed, setActivityFeed] = useState<ActivityItem[]>([])
   const [nowMs, setNowMs] = useState(() => Date.now())
+  const [isDrawerExpanded, setIsDrawerExpanded] = useState(false)
   const ownChannelRef = useRef<RealtimeChannel | null>(null)
   const hasCenteredOnSelfRef = useRef(false)
+  const drawerStartYRef = useRef<number | null>(null)
+  const drawerDeltaYRef = useRef(0)
 
   const resetLocationState = () => {
     setSelfMarker(null)
@@ -539,21 +543,38 @@ function App() {
   const handleSignIn = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setAuthError(null)
+    setAuthNotice(null)
     setAuthLoading(true)
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) setAuthError(error.message)
+    const normalizedEmail = email.trim().toLowerCase()
+    const { error } = await supabase.auth.signInWithPassword({
+      email: normalizedEmail,
+      password,
+    })
+    if (error) {
+      const isInvalidCredentials =
+        error.message.toLowerCase().includes('invalid login credentials') ||
+        error.code === 'invalid_credentials'
+      setAuthError(
+        isInvalidCredentials
+          ? 'Invalid email or password. Try again or reset your password.'
+          : error.message,
+      )
+      setIsDrawerExpanded(true)
+    }
     setAuthLoading(false)
   }
 
   const handleSignUp = async () => {
     setAuthError(null)
+    setAuthNotice(null)
     setAuthLoading(true)
+    const normalizedEmail = email.trim().toLowerCase()
     const { error } = await supabase.auth.signUp({
-      email,
+      email: normalizedEmail,
       password,
       options: {
         data: {
-          username,
+          username: username.trim(),
         },
       },
     })
@@ -565,6 +586,30 @@ function App() {
           ? 'Sign-up is temporarily rate-limited. Try again in a few minutes.'
           : error.message,
       )
+      setIsDrawerExpanded(true)
+    } else {
+      setAuthNotice('Account created. You can sign in now.')
+    }
+    setAuthLoading(false)
+  }
+
+  const handleForgotPassword = async () => {
+    setAuthError(null)
+    setAuthNotice(null)
+    const normalizedEmail = email.trim().toLowerCase()
+    if (!normalizedEmail) {
+      setAuthError('Enter your email first, then tap Forgot password.')
+      setIsDrawerExpanded(true)
+      return
+    }
+
+    setAuthLoading(true)
+    const { error } = await supabase.auth.resetPasswordForEmail(normalizedEmail)
+    if (error) {
+      setAuthError(error.message)
+      setIsDrawerExpanded(true)
+    } else {
+      setAuthNotice('Password reset email sent.')
     }
     setAuthLoading(false)
   }
@@ -702,6 +747,7 @@ function App() {
 
   const handleMapTap = (position: LatLngTuple) => {
     if (!session?.user) return
+    setIsDrawerExpanded(true)
     setPinDraft({
       lat: position[0],
       lng: position[1],
@@ -795,6 +841,24 @@ function App() {
   const handleSignOut = async () => {
     await supabase.auth.signOut()
     resetLocationState()
+  }
+
+  const handleDrawerTouchStart = (clientY: number) => {
+    drawerStartYRef.current = clientY
+    drawerDeltaYRef.current = 0
+  }
+
+  const handleDrawerTouchMove = (clientY: number) => {
+    if (drawerStartYRef.current === null) return
+    drawerDeltaYRef.current = clientY - drawerStartYRef.current
+  }
+
+  const handleDrawerTouchEnd = () => {
+    const delta = drawerDeltaYRef.current
+    if (delta < -40) setIsDrawerExpanded(true)
+    if (delta > 40) setIsDrawerExpanded(false)
+    drawerStartYRef.current = null
+    drawerDeltaYRef.current = 0
   }
 
   return (
@@ -909,9 +973,26 @@ function App() {
         ) : null}
       </section>
 
-      <aside className="pointer-events-none absolute inset-x-0 bottom-0 z-[500] p-3 md:max-w-md">
-        <div className="pointer-events-auto rounded-t-2xl bg-slate-950/85 p-4 shadow-xl ring-1 ring-slate-700 backdrop-blur md:rounded-2xl">
-          <div className="mx-auto mb-4 h-1.5 w-10 rounded-full bg-slate-600 md:hidden" />
+      <aside className="pointer-events-none absolute inset-x-0 bottom-0 z-[500] overflow-hidden p-3 md:max-w-md">
+        <div
+          className={`pointer-events-auto rounded-t-2xl bg-slate-950/85 p-4 shadow-xl ring-1 ring-slate-700 backdrop-blur transition-transform duration-300 md:translate-y-0 md:rounded-2xl ${
+            isDrawerExpanded ? 'translate-y-0' : 'translate-y-[calc(100%-8.5rem)]'
+          }`}
+        >
+          <button
+            type="button"
+            className="mb-3 w-full cursor-grab active:cursor-grabbing md:hidden"
+            onClick={() => setIsDrawerExpanded((previous) => !previous)}
+            onTouchStart={(event) => handleDrawerTouchStart(event.touches[0].clientY)}
+            onTouchMove={(event) => handleDrawerTouchMove(event.touches[0].clientY)}
+            onTouchEnd={handleDrawerTouchEnd}
+            aria-label={isDrawerExpanded ? 'Collapse social drawer' : 'Expand social drawer'}
+          >
+            <div className="mx-auto mb-1 h-1.5 w-10 rounded-full bg-slate-600" />
+            <p className="text-center text-[11px] text-slate-400">
+              {isDrawerExpanded ? 'Swipe down to collapse' : 'Swipe up for social'}
+            </p>
+          </button>
           <h1 className="text-lg font-semibold">locatd</h1>
           <p className="mt-1 text-xs text-slate-400">
             Live location map with Supabase realtime.
@@ -1143,7 +1224,10 @@ function App() {
                 className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
                 placeholder="Email"
                 value={email}
-                onChange={(event) => setEmail(event.target.value)}
+                onChange={(event) => {
+                  setEmail(event.target.value)
+                  if (authError) setAuthError(null)
+                }}
               />
               <input
                 type="text"
@@ -1158,9 +1242,13 @@ function App() {
                 className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
                 placeholder="Password"
                 value={password}
-                onChange={(event) => setPassword(event.target.value)}
+                onChange={(event) => {
+                  setPassword(event.target.value)
+                  if (authError) setAuthError(null)
+                }}
               />
               {authError ? <p className="text-xs text-rose-300">{authError}</p> : null}
+              {authNotice ? <p className="text-xs text-emerald-300">{authNotice}</p> : null}
               <div className="grid grid-cols-2 gap-2">
                 <button
                   disabled={authLoading}
@@ -1178,6 +1266,14 @@ function App() {
                   Sign up
                 </button>
               </div>
+              <button
+                disabled={authLoading}
+                type="button"
+                className="w-full rounded-lg border border-slate-600 px-3 py-2 text-xs font-medium text-slate-200 disabled:opacity-50"
+                onClick={() => void handleForgotPassword()}
+              >
+                Forgot password
+              </button>
             </form>
           )}
         </div>
