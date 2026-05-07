@@ -1,15 +1,22 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import type { RealtimeChannel, Session } from '@supabase/supabase-js'
 import { divIcon, type LatLngTuple } from 'leaflet'
-import { MapContainer, Marker, Popup, TileLayer, useMap } from 'react-leaflet'
+import {
+  MapContainer,
+  Marker,
+  Popup,
+  TileLayer,
+  useMap,
+  useMapEvents,
+} from 'react-leaflet'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 
 type MarkerModel = {
   id: string
   name: string
   position: LatLngTuple
-  role: 'test-user' | 'self' | 'friend'
+  role: 'test-user' | 'self' | 'friend' | 'pin'
   lastSeenAt?: string
 }
 
@@ -30,11 +37,57 @@ type UserRow = {
   location_visible: boolean
 }
 
+type SearchUserRow = {
+  id: string
+  username: string | null
+  full_name: string | null
+}
+
+type FriendshipRow = {
+  id: string
+  requester_id: string
+  addressee_id: string
+  status: 'pending' | 'accepted' | 'blocked'
+}
+
 type LocationRow = {
   user_id: string
   lat: number
   lng: number
   last_seen_at: string
+}
+
+type PinRow = {
+  id: string
+  user_id: string
+  lat: number
+  lng: number
+  note: string | null
+  photo_url: string | null
+  emoji: string | null
+  visibility: 'private' | 'friends' | 'public'
+  created_at: string
+}
+
+type ReactionRow = {
+  pin_id: string
+  emoji: string
+}
+
+type PinDraft = {
+  lat: number
+  lng: number
+  note: string
+  emoji: string
+  photoUrl: string
+  visibility: 'private' | 'friends' | 'public'
+}
+
+type ActivityItem = {
+  id: string
+  title: string
+  detail: string
+  at: string
 }
 
 type BroadcastLocationPayload = {
@@ -62,19 +115,21 @@ function createMarkerIcon(role: MarkerModel['role']) {
       ? 'marker marker-self'
       : role === 'friend'
         ? 'marker marker-friend'
+        : role === 'pin'
+          ? 'marker marker-pin'
         : 'marker marker-test-user'
 
   return divIcon({
     className: iconClass,
-    iconSize: [20, 20],
-    iconAnchor: [10, 10],
-    popupAnchor: [0, -12],
+    iconSize: role === 'pin' ? [16, 16] : [20, 20],
+    iconAnchor: role === 'pin' ? [8, 8] : [10, 10],
+    popupAnchor: [0, role === 'pin' ? -10 : -12],
   })
 }
 
-function formatLastSeen(lastSeenAt?: string) {
+function formatLastSeen(lastSeenAt: string | undefined, nowMs: number) {
   if (!lastSeenAt) return 'Last seen unknown'
-  const elapsedMs = Date.now() - new Date(lastSeenAt).getTime()
+  const elapsedMs = nowMs - new Date(lastSeenAt).getTime()
   if (elapsedMs < 15_000) return 'Live now'
   const seconds = Math.floor(elapsedMs / 1000)
   if (seconds < 60) return `Seen ${seconds}s ago`
@@ -82,6 +137,28 @@ function formatLastSeen(lastSeenAt?: string) {
   if (minutes < 60) return `Seen ${minutes}m ago`
   const hours = Math.floor(minutes / 60)
   return `Seen ${hours}h ago`
+}
+
+function formatTimestamp(timestampIso: string) {
+  const date = new Date(timestampIso)
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+function MapTapCapture({
+  enabled,
+  onTap,
+}: {
+  enabled: boolean
+  onTap: (position: LatLngTuple) => void
+}) {
+  useMapEvents({
+    click(event) {
+      if (!enabled) return
+      onTap([event.latlng.lat, event.latlng.lng])
+    },
+  })
+
+  return null
 }
 
 function App() {
@@ -95,13 +172,22 @@ function App() {
   const [searchError, setSearchError] = useState<string | null>(null)
   const [center, setCenter] = useState<LatLngTuple>(DEFAULT_CENTER)
   const [selfMarker, setSelfMarker] = useState<MarkerModel | null>(null)
-  const [friendMarkers, setFriendMarkers] = useState<Record<string, MarkerModel>>(
-    {},
-  )
+  const [friendMarkers, setFriendMarkers] = useState<Record<string, MarkerModel>>({})
   const [friendIds, setFriendIds] = useState<string[]>([])
   const [nameByUserId, setNameByUserId] = useState<Record<string, string>>({})
   const [locationVisible, setLocationVisible] = useState(true)
   const [locationStatus, setLocationStatus] = useState<string | null>(null)
+  const [friendshipRows, setFriendshipRows] = useState<FriendshipRow[]>([])
+  const [searchUsersInput, setSearchUsersInput] = useState('')
+  const [userSearchResults, setUserSearchResults] = useState<SearchUserRow[]>([])
+  const [friendStatus, setFriendStatus] = useState<string | null>(null)
+  const [pins, setPins] = useState<PinRow[]>([])
+  const [pinDraft, setPinDraft] = useState<PinDraft | null>(null)
+  const [pinStatus, setPinStatus] = useState<string | null>(null)
+  const [reactionCounts, setReactionCounts] = useState<
+    Record<string, Record<string, number>>
+  >({})
+  const [activityFeed, setActivityFeed] = useState<ActivityItem[]>([])
   const [nowMs, setNowMs] = useState(() => Date.now())
   const ownChannelRef = useRef<RealtimeChannel | null>(null)
   const hasCenteredOnSelfRef = useRef(false)
@@ -113,19 +199,182 @@ function App() {
     setNameByUserId({})
     setLocationStatus(null)
     setLocationVisible(true)
+    setFriendshipRows([])
+    setUserSearchResults([])
+    setFriendStatus(null)
+    setPins([])
+    setPinDraft(null)
+    setPinStatus(null)
+    setReactionCounts({})
+    setActivityFeed([])
     hasCenteredOnSelfRef.current = false
   }
+
+  const getDisplayName = (userId: string) => {
+    if (userId === session?.user?.id) return 'You'
+    return nameByUserId[userId] ?? 'Friend'
+  }
+
+  const loadSocialDataForUser = useCallback(async (activeSession: Session) => {
+    const userId = activeSession.user.id
+
+    const [{ data: selfUser }, { data: friendships }, { data: fetchedPins }] =
+      await Promise.all([
+        supabase
+          .from('users')
+          .select('id, username, full_name, location_visible')
+          .eq('id', userId)
+          .maybeSingle<UserRow>(),
+        supabase
+          .from('friendships')
+          .select('id, requester_id, addressee_id, status')
+          .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`),
+        supabase
+          .from('pins')
+          .select('id, user_id, lat, lng, note, photo_url, emoji, visibility, created_at')
+          .order('created_at', { ascending: false })
+          .limit(50),
+      ])
+
+    const friendshipList = (friendships ?? []) as FriendshipRow[]
+    setFriendshipRows(friendshipList)
+
+    const acceptedFriendIds = friendshipList
+      .filter((row) => row.status === 'accepted')
+      .map((row) =>
+        row.requester_id === userId ? row.addressee_id : row.requester_id,
+      )
+    setFriendIds(acceptedFriendIds)
+
+    if (selfUser) {
+      setLocationVisible(selfUser.location_visible)
+    }
+
+    const relatedUserIds = new Set<string>([
+      userId,
+      ...friendshipList.map((row) => row.requester_id),
+      ...friendshipList.map((row) => row.addressee_id),
+      ...acceptedFriendIds,
+      ...(fetchedPins ?? []).map((pin) => pin.user_id),
+    ])
+
+    const relatedIds = [...relatedUserIds]
+    const nextNameMap: Record<string, string> = {
+      [userId]:
+        selfUser?.full_name || selfUser?.username || activeSession.user.email || 'You',
+    }
+
+    if (relatedIds.length > 0) {
+      const { data: relatedUsers } = await supabase
+        .from('users')
+        .select('id, username, full_name')
+        .in('id', relatedIds)
+
+      for (const profile of relatedUsers ?? []) {
+        nextNameMap[profile.id] = profile.full_name || profile.username || 'Friend'
+      }
+    }
+    setNameByUserId(nextNameMap)
+
+    const locationTargetIds = [userId, ...acceptedFriendIds]
+    const { data: knownLocations } =
+      locationTargetIds.length > 0
+        ? await supabase
+            .from('locations')
+            .select('user_id, lat, lng, last_seen_at')
+            .in('user_id', locationTargetIds)
+        : { data: [] as LocationRow[] }
+
+    let nextSelfMarker: MarkerModel | null = null
+    const nextFriendMarkers: Record<string, MarkerModel> = {}
+    const locationRows = (knownLocations ?? []) as LocationRow[]
+
+    for (const location of locationRows) {
+      const marker: MarkerModel = {
+        id: location.user_id,
+        name: nextNameMap[location.user_id] ?? 'Friend',
+        position: [location.lat, location.lng],
+        role: location.user_id === userId ? 'self' : 'friend',
+        lastSeenAt: location.last_seen_at,
+      }
+      if (location.user_id === userId) {
+        nextSelfMarker = marker
+      } else {
+        nextFriendMarkers[location.user_id] = marker
+      }
+    }
+
+    setSelfMarker(nextSelfMarker)
+    if (nextSelfMarker && !hasCenteredOnSelfRef.current) {
+      setCenter(nextSelfMarker.position)
+      hasCenteredOnSelfRef.current = true
+    }
+    setFriendMarkers(nextFriendMarkers)
+
+    const nextPins = (fetchedPins ?? []) as PinRow[]
+    setPins(nextPins)
+
+    let nextReactionCounts: Record<string, Record<string, number>> = {}
+    if (nextPins.length > 0) {
+      const { data: reactions } = await supabase
+        .from('reactions')
+        .select('pin_id, emoji')
+        .in(
+          'pin_id',
+          nextPins.map((pin) => pin.id),
+        )
+
+      nextReactionCounts = {}
+      for (const reaction of (reactions ?? []) as ReactionRow[]) {
+        if (!nextReactionCounts[reaction.pin_id]) {
+          nextReactionCounts[reaction.pin_id] = {}
+        }
+        nextReactionCounts[reaction.pin_id][reaction.emoji] =
+          (nextReactionCounts[reaction.pin_id][reaction.emoji] ?? 0) + 1
+      }
+    }
+    setReactionCounts(nextReactionCounts)
+
+    const pinFeed: ActivityItem[] = nextPins.slice(0, 12).map((pin) => ({
+      id: `pin-${pin.id}`,
+      title: `${nextNameMap[pin.user_id] ?? 'Friend'} dropped a pin ${
+        pin.emoji ?? '📍'
+      }`,
+      detail: pin.note ?? 'No note attached.',
+      at: pin.created_at,
+    }))
+
+    const checkinFeed: ActivityItem[] = locationRows
+      .filter((row) => row.user_id !== userId)
+      .map((row) => ({
+        id: `checkin-${row.user_id}`,
+        title: `${nextNameMap[row.user_id] ?? 'Friend'} checked in`,
+        detail: formatLastSeen(row.last_seen_at, Date.now()),
+        at: row.last_seen_at,
+      }))
+
+    setActivityFeed(
+      [...pinFeed, ...checkinFeed]
+        .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+        .slice(0, 20),
+    )
+  }, [])
 
   useEffect(() => {
     void supabase.auth.getSession().then(({ data }) => {
       setSession(data.session)
+      if (data.session) {
+        void loadSocialDataForUser(data.session)
+      }
     })
 
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       setSession(nextSession)
-      if (!nextSession) {
+      if (nextSession) {
+        void loadSocialDataForUser(nextSession)
+      } else {
         resetLocationState()
       }
     })
@@ -133,85 +382,7 @@ function App() {
     return () => {
       subscription.unsubscribe()
     }
-  }, [])
-
-  useEffect(() => {
-    if (!session?.user) return
-
-    const bootstrapSocialMap = async () => {
-      const userId = session.user.id
-
-      const { data: selfUser } = await supabase
-        .from('users')
-        .select('id, username, full_name, location_visible')
-        .eq('id', userId)
-        .maybeSingle<UserRow>()
-
-      if (selfUser) {
-        setLocationVisible(selfUser.location_visible)
-      }
-
-      const { data: friendships } = await supabase
-        .from('friendships')
-        .select('requester_id, addressee_id')
-        .eq('status', 'accepted')
-        .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`)
-
-      const acceptedFriendIds = (friendships ?? []).map((friendship) =>
-        friendship.requester_id === userId
-          ? friendship.addressee_id
-          : friendship.requester_id,
-      )
-      setFriendIds(acceptedFriendIds)
-
-      const idsToLoad = [userId, ...acceptedFriendIds]
-      const nextNameMap: Record<string, string> = {
-        [userId]: selfUser?.full_name || selfUser?.username || session.user.email || 'You',
-      }
-
-      if (acceptedFriendIds.length > 0) {
-        const { data: friendProfiles } = await supabase
-          .from('users')
-          .select('id, username, full_name')
-          .in('id', acceptedFriendIds)
-
-        for (const profile of friendProfiles ?? []) {
-          nextNameMap[profile.id] = profile.full_name || profile.username || 'Friend'
-        }
-      }
-      setNameByUserId(nextNameMap)
-
-      const { data: knownLocations } = await supabase
-        .from('locations')
-        .select('user_id, lat, lng, last_seen_at')
-        .in('user_id', idsToLoad)
-
-      const nextFriendMarkers: Record<string, MarkerModel> = {}
-      for (const location of (knownLocations ?? []) as LocationRow[]) {
-        const marker: MarkerModel = {
-          id: location.user_id,
-          name: nextNameMap[location.user_id] ?? 'Friend',
-          position: [location.lat, location.lng],
-          role: location.user_id === userId ? 'self' : 'friend',
-          lastSeenAt: location.last_seen_at,
-        }
-
-        if (location.user_id === userId) {
-          setSelfMarker(marker)
-          if (!hasCenteredOnSelfRef.current) {
-            setCenter(marker.position)
-            hasCenteredOnSelfRef.current = true
-          }
-        } else {
-          nextFriendMarkers[location.user_id] = marker
-        }
-      }
-
-      setFriendMarkers(nextFriendMarkers)
-    }
-
-    void bootstrapSocialMap()
-  }, [session?.user])
+  }, [loadSocialDataForUser])
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -351,10 +522,19 @@ function App() {
     }
   }, [session?.user, friendIds, nameByUserId])
 
-  const markers = useMemo(
-    () => [TEST_MARKER, ...(selfMarker ? [selfMarker] : []), ...Object.values(friendMarkers)],
-    [selfMarker, friendMarkers],
+  const userMarkers = [
+    TEST_MARKER,
+    ...(selfMarker ? [selfMarker] : []),
+    ...Object.values(friendMarkers),
+  ]
+  const currentUserId = session?.user?.id ?? ''
+  const incomingRequests = friendshipRows.filter(
+    (row) => row.status === 'pending' && row.addressee_id === currentUserId,
   )
+  const outgoingRequests = friendshipRows.filter(
+    (row) => row.status === 'pending' && row.requester_id === currentUserId,
+  )
+  const friends = friendshipRows.filter((row) => row.status === 'accepted')
 
   const handleSignIn = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -387,6 +567,101 @@ function App() {
       )
     }
     setAuthLoading(false)
+  }
+
+  const handleSearchUsers = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setFriendStatus(null)
+    if (!searchUsersInput.trim()) {
+      setUserSearchResults([])
+      return
+    }
+
+    const { data, error } = await supabase.rpc('search_users', {
+      query_text: searchUsersInput.trim(),
+    })
+    if (error) {
+      setFriendStatus(error.message)
+      return
+    }
+    setUserSearchResults((data ?? []) as SearchUserRow[])
+  }
+
+  const handleSendFriendRequest = async (targetUserId: string) => {
+    if (!session?.user) return
+    setFriendStatus(null)
+    const userId = session.user.id
+
+    const directExisting = friendshipRows.find(
+      (row) =>
+        row.requester_id === userId &&
+        row.addressee_id === targetUserId &&
+        row.status !== 'blocked',
+    )
+    if (directExisting) {
+      setFriendStatus('Friend request already exists.')
+      return
+    }
+
+    const reversePending = friendshipRows.find(
+      (row) =>
+        row.requester_id === targetUserId &&
+        row.addressee_id === userId &&
+        row.status === 'pending',
+    )
+    if (reversePending) {
+      const { error: acceptError } = await supabase
+        .from('friendships')
+        .update({ status: 'accepted' })
+        .eq('id', reversePending.id)
+      if (acceptError) {
+        setFriendStatus(acceptError.message)
+        return
+      }
+      setFriendStatus('Friend request accepted.')
+      await loadSocialDataForUser(session)
+      return
+    }
+
+    const { error } = await supabase.from('friendships').insert({
+      requester_id: userId,
+      addressee_id: targetUserId,
+      status: 'pending',
+    })
+    if (error) {
+      setFriendStatus(error.message)
+      return
+    }
+
+    setFriendStatus('Friend request sent.')
+    await loadSocialDataForUser(session)
+  }
+
+  const handleAcceptRequest = async (friendshipId: string) => {
+    setFriendStatus(null)
+    const { error } = await supabase
+      .from('friendships')
+      .update({ status: 'accepted' })
+      .eq('id', friendshipId)
+    if (error) {
+      setFriendStatus(error.message)
+      return
+    }
+    if (session) {
+      await loadSocialDataForUser(session)
+    }
+  }
+
+  const handleDeclineRequest = async (friendshipId: string) => {
+    setFriendStatus(null)
+    const { error } = await supabase.from('friendships').delete().eq('id', friendshipId)
+    if (error) {
+      setFriendStatus(error.message)
+      return
+    }
+    if (session) {
+      await loadSocialDataForUser(session)
+    }
   }
 
   const handleToggleLocationVisibility = async () => {
@@ -423,6 +698,68 @@ function App() {
     }
 
     setLocationStatus('Location sharing enabled')
+  }
+
+  const handleMapTap = (position: LatLngTuple) => {
+    if (!session?.user) return
+    setPinDraft({
+      lat: position[0],
+      lng: position[1],
+      note: '',
+      emoji: '📍',
+      photoUrl: '',
+      visibility: 'friends',
+    })
+    setPinStatus('Pin draft placed. Add details below.')
+  }
+
+  const handleCreatePin = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!session?.user || !pinDraft) return
+    setPinStatus(null)
+    const { error } = await supabase.from('pins').insert({
+      user_id: session.user.id,
+      lat: pinDraft.lat,
+      lng: pinDraft.lng,
+      note: pinDraft.note.trim() || null,
+      photo_url: pinDraft.photoUrl.trim() || null,
+      emoji: pinDraft.emoji.trim() || null,
+      visibility: pinDraft.visibility,
+    })
+    if (error) {
+      setPinStatus(error.message)
+      return
+    }
+
+    setPinDraft(null)
+    setPinStatus('Pin posted.')
+    await loadSocialDataForUser(session)
+  }
+
+  const handleReactToPin = async (pinId: string, emoji: string) => {
+    if (!session?.user) return
+    const { error } = await supabase.from('reactions').insert({
+      pin_id: pinId,
+      user_id: session.user.id,
+      emoji,
+    })
+
+    if (error?.message.includes('duplicate key value')) {
+      await supabase
+        .from('reactions')
+        .delete()
+        .eq('pin_id', pinId)
+        .eq('user_id', session.user.id)
+        .eq('emoji', emoji)
+      await loadSocialDataForUser(session)
+      return
+    }
+
+    if (error) {
+      setPinStatus(error.message)
+      return
+    }
+    await loadSocialDataForUser(session)
   }
 
   const handleSearch = async (event: FormEvent<HTMLFormElement>) => {
@@ -473,7 +810,8 @@ function App() {
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
         <MapRecenter center={center} />
-        {markers.map((marker) => (
+        <MapTapCapture enabled={Boolean(session?.user)} onTap={handleMapTap} />
+        {userMarkers.map((marker) => (
           <Marker
             key={marker.id}
             position={marker.position}
@@ -484,12 +822,61 @@ function App() {
                 <p className="font-medium">{marker.name}</p>
                 {marker.role !== 'test-user' ? (
                   <p className="text-slate-500">
-                    {formatLastSeen(marker.lastSeenAt)}
+                    {formatLastSeen(marker.lastSeenAt, nowMs)}
                     {marker.lastSeenAt &&
                     nowMs - new Date(marker.lastSeenAt).getTime() > STALE_AFTER_MS
                       ? ' (stale)'
                       : ''}
                   </p>
+                ) : null}
+              </div>
+            </Popup>
+          </Marker>
+        ))}
+        {pins.map((pin) => (
+          <Marker
+            key={`pin-${pin.id}`}
+            position={[pin.lat, pin.lng]}
+            icon={createMarkerIcon('pin')}
+          >
+            <Popup>
+              <div className="w-52 space-y-2 text-sm">
+                <p className="font-medium">{getDisplayName(pin.user_id)}</p>
+                <p className="text-xs text-slate-500">{formatTimestamp(pin.created_at)}</p>
+                <p>{pin.emoji ?? '📍'} {pin.note ?? 'No note'}</p>
+                {pin.photo_url ? (
+                  <a
+                    className="text-xs text-blue-500 underline"
+                    href={pin.photo_url}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open photo
+                  </a>
+                ) : null}
+                <div className="flex flex-wrap gap-1 text-xs">
+                  {Object.entries(reactionCounts[pin.id] ?? {}).map(([emoji, count]) => (
+                    <span
+                      key={`${pin.id}-${emoji}`}
+                      className="rounded bg-slate-800 px-2 py-1"
+                    >
+                      {emoji} {count}
+                    </span>
+                  ))}
+                </div>
+                {session?.user ? (
+                  <div className="flex gap-1">
+                    {['👍', '❤️', '😂'].map((emoji) => (
+                      <button
+                        key={`${pin.id}-react-${emoji}`}
+                        type="button"
+                        className="rounded bg-slate-700 px-2 py-1 text-xs"
+                        onClick={() => void handleReactToPin(pin.id, emoji)}
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
                 ) : null}
               </div>
             </Popup>
@@ -538,7 +925,7 @@ function App() {
           ) : null}
 
           {session?.user ? (
-            <div className="mt-4 space-y-2 text-sm">
+            <div className="mt-4 space-y-3 text-sm">
               <p className="text-slate-300">
                 Signed in as <span className="font-medium">{session.user.email}</span>
               </p>
@@ -556,6 +943,190 @@ function App() {
               {locationStatus ? (
                 <p className="text-xs text-slate-300">{locationStatus}</p>
               ) : null}
+              <form className="space-y-2" onSubmit={handleSearchUsers}>
+                <input
+                  className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"
+                  placeholder="Find users by name"
+                  value={searchUsersInput}
+                  onChange={(event) => setSearchUsersInput(event.target.value)}
+                />
+                <button
+                  type="submit"
+                  className="w-full rounded-lg bg-indigo-600 px-3 py-2 font-medium hover:bg-indigo-500"
+                >
+                  Search users
+                </button>
+              </form>
+              {userSearchResults.length > 0 ? (
+                <div className="max-h-24 space-y-1 overflow-y-auto rounded-lg bg-slate-900/70 p-2">
+                  {userSearchResults.map((user) => (
+                    <div
+                      key={`search-user-${user.id}`}
+                      className="flex items-center justify-between gap-2 text-xs"
+                    >
+                      <span className="truncate">
+                        {user.full_name || user.username || 'User'}
+                      </span>
+                      <button
+                        type="button"
+                        className="rounded bg-blue-600 px-2 py-1"
+                        onClick={() => void handleSendFriendRequest(user.id)}
+                      >
+                        Add
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {incomingRequests.length > 0 ? (
+                <div className="space-y-1 rounded-lg bg-slate-900/70 p-2">
+                  <p className="text-xs font-medium text-slate-300">Incoming requests</p>
+                  {incomingRequests.map((row) => (
+                    <div key={`incoming-${row.id}`} className="flex items-center gap-2 text-xs">
+                      <span className="flex-1 truncate">
+                        {getDisplayName(row.requester_id)}
+                      </span>
+                      <button
+                        type="button"
+                        className="rounded bg-emerald-600 px-2 py-1"
+                        onClick={() => void handleAcceptRequest(row.id)}
+                      >
+                        Accept
+                      </button>
+                      <button
+                        type="button"
+                        className="rounded bg-slate-600 px-2 py-1"
+                        onClick={() => void handleDeclineRequest(row.id)}
+                      >
+                        Decline
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <div className="space-y-1 rounded-lg bg-slate-900/70 p-2">
+                <p className="text-xs font-medium text-slate-300">Friends</p>
+                {friends.length ? (
+                  friends.map((row) => {
+                    const friendId =
+                      row.requester_id === session.user.id
+                        ? row.addressee_id
+                        : row.requester_id
+                    return (
+                      <p key={`friend-${row.id}`} className="text-xs">
+                        {getDisplayName(friendId)}
+                      </p>
+                    )
+                  })
+                ) : (
+                  <p className="text-xs text-slate-500">No friends added yet.</p>
+                )}
+              </div>
+              {outgoingRequests.length > 0 ? (
+                <div className="space-y-1 rounded-lg bg-slate-900/70 p-2">
+                  <p className="text-xs font-medium text-slate-300">Pending sent requests</p>
+                  {outgoingRequests.map((row) => (
+                    <p key={`outgoing-${row.id}`} className="text-xs text-slate-400">
+                      {getDisplayName(row.addressee_id)}
+                    </p>
+                  ))}
+                </div>
+              ) : null}
+              {friendStatus ? (
+                <p className="text-xs text-sky-300">{friendStatus}</p>
+              ) : null}
+              {pinDraft ? (
+                <form className="space-y-2 rounded-lg bg-slate-900/70 p-2" onSubmit={handleCreatePin}>
+                  <p className="text-xs font-medium text-slate-300">
+                    New pin at {pinDraft.lat.toFixed(4)}, {pinDraft.lng.toFixed(4)}
+                  </p>
+                  <input
+                    className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs"
+                    placeholder="Emoji"
+                    value={pinDraft.emoji}
+                    onChange={(event) =>
+                      setPinDraft((previous) =>
+                        previous ? { ...previous, emoji: event.target.value } : previous,
+                      )
+                    }
+                  />
+                  <input
+                    className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs"
+                    placeholder="Note"
+                    value={pinDraft.note}
+                    onChange={(event) =>
+                      setPinDraft((previous) =>
+                        previous ? { ...previous, note: event.target.value } : previous,
+                      )
+                    }
+                  />
+                  <input
+                    className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs"
+                    placeholder="Photo URL (optional)"
+                    value={pinDraft.photoUrl}
+                    onChange={(event) =>
+                      setPinDraft((previous) =>
+                        previous ? { ...previous, photoUrl: event.target.value } : previous,
+                      )
+                    }
+                  />
+                  <select
+                    className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs"
+                    value={pinDraft.visibility}
+                    onChange={(event) =>
+                      setPinDraft((previous) =>
+                        previous
+                          ? {
+                              ...previous,
+                              visibility: event.target.value as PinDraft['visibility'],
+                            }
+                          : previous,
+                      )
+                    }
+                  >
+                    <option value="private">Private</option>
+                    <option value="friends">Friends</option>
+                    <option value="public">Public</option>
+                  </select>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="submit"
+                      className="rounded bg-fuchsia-600 px-2 py-1 text-xs font-medium"
+                    >
+                      Drop pin
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded bg-slate-700 px-2 py-1 text-xs"
+                      onClick={() => setPinDraft(null)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <p className="text-xs text-slate-500">
+                  Tap the map to place a new pin.
+                </p>
+              )}
+              {pinStatus ? <p className="text-xs text-sky-300">{pinStatus}</p> : null}
+              <div className="space-y-1 rounded-lg bg-slate-900/70 p-2">
+                <p className="text-xs font-medium text-slate-300">Activity feed</p>
+                {activityFeed.length ? (
+                  <div className="max-h-28 space-y-1 overflow-y-auto">
+                    {activityFeed.map((item) => (
+                      <div key={item.id} className="text-xs text-slate-300">
+                        <p>{item.title}</p>
+                        <p className="text-slate-500">
+                          {item.detail} - {formatTimestamp(item.at)}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-500">No activity yet.</p>
+                )}
+              </div>
               <button
                 type="button"
                 className="w-full rounded-lg bg-slate-700 px-3 py-2 font-medium hover:bg-slate-600"
