@@ -3,7 +3,7 @@ import type { FormEvent } from 'react'
 import type { RealtimeChannel, Session } from '@supabase/supabase-js'
 import type { LatLngTuple } from 'leaflet'
 import { AuthForm } from './components/AuthForm'
-import type { MapMarker } from './components/MapCanvas'
+import type { MapMarker, PoiMarker } from './components/MapCanvas'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 
 const LazyMapCanvas = lazy(async () =>
@@ -93,6 +93,9 @@ type BroadcastLocationPayload = {
   name?: string
 }
 
+const POI_CATEGORIES = ['cafes', 'restaurants', 'parks', 'gyms', 'hospitals'] as const
+type PoiCategory = (typeof POI_CATEGORIES)[number]
+
 function formatTimestamp(timestampIso: string) {
   const date = new Date(timestampIso)
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -134,6 +137,10 @@ function App() {
   const [pins, setPins] = useState<PinRow[]>([])
   const [pinDraft, setPinDraft] = useState<PinDraft | null>(null)
   const [pinStatus, setPinStatus] = useState<string | null>(null)
+  const [poiCategory, setPoiCategory] = useState<PoiCategory>('cafes')
+  const [poiMarkers, setPoiMarkers] = useState<PoiMarker[]>([])
+  const [poiStatus, setPoiStatus] = useState<string | null>(null)
+  const [poiLoading, setPoiLoading] = useState(false)
   const [reactionCounts, setReactionCounts] = useState<
     Record<string, Record<string, number>>
   >({})
@@ -158,6 +165,9 @@ function App() {
     setPins([])
     setPinDraft(null)
     setPinStatus(null)
+    setPoiMarkers([])
+    setPoiStatus(null)
+    setPoiLoading(false)
     setReactionCounts({})
     setActivityFeed([])
     hasCenteredOnSelfRef.current = false
@@ -787,6 +797,75 @@ function App() {
     }
   }
 
+  const handleFindNearbyPois = async () => {
+    setPoiStatus(null)
+    setPoiLoading(true)
+
+    try {
+      const [lat, lng] = center
+      const params = new URLSearchParams({
+        q: `${poiCategory} near ${lat},${lng}`,
+        format: 'jsonv2',
+        limit: '12',
+      })
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/search?${params.toString()}`,
+      )
+      if (!response.ok) {
+        throw new Error('Could not load nearby places.')
+      }
+
+      type PoiResponse = {
+        place_id: number
+        lat: string
+        lon: string
+        display_name: string
+        type: string
+      }
+      const data = (await response.json()) as PoiResponse[]
+      const nextPois: PoiMarker[] = data.map((poi) => ({
+        id: String(poi.place_id),
+        name: poi.display_name.split(',')[0] ?? poi.display_name,
+        category: poi.type || poiCategory,
+        lat: Number.parseFloat(poi.lat),
+        lng: Number.parseFloat(poi.lon),
+      }))
+
+      setPoiMarkers(nextPois)
+      setPoiStatus(
+        nextPois.length
+          ? `Showing ${nextPois.length} nearby ${poiCategory}.`
+          : `No nearby ${poiCategory} found.`,
+      )
+    } catch {
+      setPoiStatus('Unable to load nearby places right now.')
+    } finally {
+      setPoiLoading(false)
+    }
+  }
+
+  const handleCheckInAtPoi = async (poi: PoiMarker) => {
+    if (!session?.user) return
+
+    setPinStatus(null)
+    const { error } = await supabase.from('pins').insert({
+      user_id: session.user.id,
+      lat: poi.lat,
+      lng: poi.lng,
+      note: `Checked in at ${poi.name}`,
+      photo_url: null,
+      emoji: '🧭',
+      visibility: 'friends',
+    })
+    if (error) {
+      setPinStatus(error.message)
+      return
+    }
+
+    setPinStatus(`Checked in at ${poi.name}.`)
+    await loadSocialDataForUser(session)
+  }
+
   const handleSignOut = async () => {
     await supabase.auth.signOut()
     resetLocationState()
@@ -817,12 +896,14 @@ function App() {
           center={center}
           markers={userMarkers}
           pins={pins}
+          pois={poiMarkers}
           nowMs={nowMs}
           staleAfterMs={STALE_AFTER_MS}
           canDropPin={Boolean(session?.user)}
           reactionCounts={reactionCounts}
           onMapTap={handleMapTap}
           onReactToPin={(pinId, emoji) => void handleReactToPin(pinId, emoji)}
+          onCheckInAtPoi={(poi) => void handleCheckInAtPoi(poi)}
           getDisplayName={getDisplayName}
           formatTimestamp={formatTimestamp}
         />
@@ -904,6 +985,31 @@ function App() {
               {locationStatus ? (
                 <p className="text-xs text-slate-300">{locationStatus}</p>
               ) : null}
+              <div className="space-y-2 rounded-lg bg-slate-900/70 p-2">
+                <p className="text-xs font-medium text-slate-300">Nearby places</p>
+                <div className="grid grid-cols-[1fr_auto] gap-2">
+                  <select
+                    className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs"
+                    value={poiCategory}
+                    onChange={(event) => setPoiCategory(event.target.value as PoiCategory)}
+                  >
+                    {POI_CATEGORIES.map((category) => (
+                      <option key={category} value={category}>
+                        {category}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="rounded bg-indigo-600 px-3 py-1 text-xs font-medium disabled:opacity-50"
+                    onClick={() => void handleFindNearbyPois()}
+                    disabled={poiLoading}
+                  >
+                    {poiLoading ? '...' : 'Find'}
+                  </button>
+                </div>
+                {poiStatus ? <p className="text-xs text-slate-400">{poiStatus}</p> : null}
+              </div>
               <form className="space-y-2" onSubmit={handleSearchUsers}>
                 <input
                   className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring-2"

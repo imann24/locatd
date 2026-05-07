@@ -28,16 +28,26 @@ export type MapPin = {
   created_at: string
 }
 
+export type PoiMarker = {
+  id: string
+  name: string
+  category: string
+  lat: number
+  lng: number
+}
+
 type MapCanvasProps = {
   center: LatLngTuple
   markers: MapMarker[]
   pins: MapPin[]
+  pois: PoiMarker[]
   nowMs: number
   staleAfterMs: number
   canDropPin: boolean
   reactionCounts: Record<string, Record<string, number>>
   onMapTap: (position: LatLngTuple) => void
   onReactToPin: (pinId: string, emoji: string) => void
+  onCheckInAtPoi: (poi: PoiMarker) => void
   getDisplayName: (userId: string) => string
   formatTimestamp: (timestampIso: string) => string
 }
@@ -69,7 +79,7 @@ function MapTapCapture({
   return null
 }
 
-function createMarkerIcon(role: 'test-user' | 'self' | 'friend' | 'pin') {
+function createMarkerIcon(role: 'test-user' | 'self' | 'friend' | 'pin' | 'poi') {
   const iconClass =
     role === 'self'
       ? 'marker marker-self'
@@ -77,13 +87,15 @@ function createMarkerIcon(role: 'test-user' | 'self' | 'friend' | 'pin') {
         ? 'marker marker-friend'
         : role === 'pin'
           ? 'marker marker-pin'
+          : role === 'poi'
+            ? 'marker marker-poi'
           : 'marker marker-test-user'
 
   return divIcon({
     className: iconClass,
-    iconSize: role === 'pin' ? [16, 16] : [20, 20],
-    iconAnchor: role === 'pin' ? [8, 8] : [10, 10],
-    popupAnchor: [0, role === 'pin' ? -10 : -12],
+    iconSize: role === 'pin' || role === 'poi' ? [16, 16] : [20, 20],
+    iconAnchor: role === 'pin' || role === 'poi' ? [8, 8] : [10, 10],
+    popupAnchor: [0, role === 'pin' || role === 'poi' ? -10 : -12],
   })
 }
 
@@ -103,12 +115,14 @@ export function MapCanvas({
   center,
   markers,
   pins,
+  pois,
   nowMs,
   staleAfterMs,
   canDropPin,
   reactionCounts,
   onMapTap,
   onReactToPin,
+  onCheckInAtPoi,
   getDisplayName,
   formatTimestamp,
 }: MapCanvasProps) {
@@ -193,6 +207,29 @@ export function MapCanvas({
                     </button>
                   ))}
                 </div>
+              ) : null}
+            </div>
+          </Popup>
+        </Marker>
+      ))}
+      {pois.map((poi) => (
+        <Marker
+          key={`poi-${poi.id}`}
+          position={[poi.lat, poi.lng]}
+          icon={createMarkerIcon('poi')}
+        >
+          <Popup>
+            <div className="w-52 space-y-2 text-sm">
+              <p className="font-medium">{poi.name}</p>
+              <p className="text-xs text-slate-500 capitalize">{poi.category}</p>
+              {canDropPin ? (
+                <button
+                  type="button"
+                  className="rounded bg-indigo-600 px-2 py-1 text-xs"
+                  onClick={() => onCheckInAtPoi(poi)}
+                >
+                  Check in here
+                </button>
               ) : null}
             </div>
           </Popup>
