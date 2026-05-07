@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import type { Session } from '@supabase/supabase-js'
+import type { RealtimeChannel, Session } from '@supabase/supabase-js'
 import { divIcon, type LatLngTuple } from 'leaflet'
 import { MapContainer, Marker, Popup, TileLayer, useMap } from 'react-leaflet'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
@@ -9,16 +9,41 @@ type MarkerModel = {
   id: string
   name: string
   position: LatLngTuple
-  role: 'test-user' | 'self'
+  role: 'test-user' | 'self' | 'friend'
+  lastSeenAt?: string
 }
 
 const DEFAULT_CENTER: LatLngTuple = [37.7749, -122.4194]
+const STALE_AFTER_MS = 90_000
 
 const TEST_MARKER: MarkerModel = {
   id: 'test-user',
   name: 'Test User (seed marker)',
   position: [37.7833, -122.4167],
   role: 'test-user',
+}
+
+type UserRow = {
+  id: string
+  username: string | null
+  full_name: string | null
+  location_visible: boolean
+}
+
+type LocationRow = {
+  user_id: string
+  lat: number
+  lng: number
+  last_seen_at: string
+}
+
+type BroadcastLocationPayload = {
+  userId: string
+  lat: number
+  lng: number
+  lastSeenAt: string
+  visible: boolean
+  name?: string
 }
 
 function MapRecenter({ center }: { center: LatLngTuple }) {
@@ -33,13 +58,30 @@ function MapRecenter({ center }: { center: LatLngTuple }) {
 
 function createMarkerIcon(role: MarkerModel['role']) {
   const iconClass =
-    role === 'self' ? 'marker marker-self' : 'marker marker-test-user'
+    role === 'self'
+      ? 'marker marker-self'
+      : role === 'friend'
+        ? 'marker marker-friend'
+        : 'marker marker-test-user'
+
   return divIcon({
     className: iconClass,
     iconSize: [20, 20],
     iconAnchor: [10, 10],
     popupAnchor: [0, -12],
   })
+}
+
+function formatLastSeen(lastSeenAt?: string) {
+  if (!lastSeenAt) return 'Last seen unknown'
+  const elapsedMs = Date.now() - new Date(lastSeenAt).getTime()
+  if (elapsedMs < 15_000) return 'Live now'
+  const seconds = Math.floor(elapsedMs / 1000)
+  if (seconds < 60) return `Seen ${seconds}s ago`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `Seen ${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  return `Seen ${hours}h ago`
 }
 
 function App() {
@@ -53,6 +95,26 @@ function App() {
   const [searchError, setSearchError] = useState<string | null>(null)
   const [center, setCenter] = useState<LatLngTuple>(DEFAULT_CENTER)
   const [selfMarker, setSelfMarker] = useState<MarkerModel | null>(null)
+  const [friendMarkers, setFriendMarkers] = useState<Record<string, MarkerModel>>(
+    {},
+  )
+  const [friendIds, setFriendIds] = useState<string[]>([])
+  const [nameByUserId, setNameByUserId] = useState<Record<string, string>>({})
+  const [locationVisible, setLocationVisible] = useState(true)
+  const [locationStatus, setLocationStatus] = useState<string | null>(null)
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  const ownChannelRef = useRef<RealtimeChannel | null>(null)
+  const hasCenteredOnSelfRef = useRef(false)
+
+  const resetLocationState = () => {
+    setSelfMarker(null)
+    setFriendMarkers({})
+    setFriendIds([])
+    setNameByUserId({})
+    setLocationStatus(null)
+    setLocationVisible(true)
+    hasCenteredOnSelfRef.current = false
+  }
 
   useEffect(() => {
     void supabase.auth.getSession().then(({ data }) => {
@@ -63,6 +125,9 @@ function App() {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       setSession(nextSession)
+      if (!nextSession) {
+        resetLocationState()
+      }
     })
 
     return () => {
@@ -71,34 +136,224 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (!navigator.geolocation || !session?.user) return
+    if (!session?.user) return
 
-    navigator.geolocation.getCurrentPosition(
-      ({ coords }) => {
-        const position: LatLngTuple = [coords.latitude, coords.longitude]
-        setSelfMarker({
-          id: session.user.id,
-          name: session.user.email ?? 'You',
-          position,
-          role: 'self',
-        })
-        setCenter(position)
-      },
-      () => {
-        setSelfMarker({
-          id: session.user.id,
-          name: session.user.email ?? 'You',
-          position: DEFAULT_CENTER,
-          role: 'self',
-        })
-      },
-      { enableHighAccuracy: true, timeout: 8000 },
-    )
+    const bootstrapSocialMap = async () => {
+      const userId = session.user.id
+
+      const { data: selfUser } = await supabase
+        .from('users')
+        .select('id, username, full_name, location_visible')
+        .eq('id', userId)
+        .maybeSingle<UserRow>()
+
+      if (selfUser) {
+        setLocationVisible(selfUser.location_visible)
+      }
+
+      const { data: friendships } = await supabase
+        .from('friendships')
+        .select('requester_id, addressee_id')
+        .eq('status', 'accepted')
+        .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`)
+
+      const acceptedFriendIds = (friendships ?? []).map((friendship) =>
+        friendship.requester_id === userId
+          ? friendship.addressee_id
+          : friendship.requester_id,
+      )
+      setFriendIds(acceptedFriendIds)
+
+      const idsToLoad = [userId, ...acceptedFriendIds]
+      const nextNameMap: Record<string, string> = {
+        [userId]: selfUser?.full_name || selfUser?.username || session.user.email || 'You',
+      }
+
+      if (acceptedFriendIds.length > 0) {
+        const { data: friendProfiles } = await supabase
+          .from('users')
+          .select('id, username, full_name')
+          .in('id', acceptedFriendIds)
+
+        for (const profile of friendProfiles ?? []) {
+          nextNameMap[profile.id] = profile.full_name || profile.username || 'Friend'
+        }
+      }
+      setNameByUserId(nextNameMap)
+
+      const { data: knownLocations } = await supabase
+        .from('locations')
+        .select('user_id, lat, lng, last_seen_at')
+        .in('user_id', idsToLoad)
+
+      const nextFriendMarkers: Record<string, MarkerModel> = {}
+      for (const location of (knownLocations ?? []) as LocationRow[]) {
+        const marker: MarkerModel = {
+          id: location.user_id,
+          name: nextNameMap[location.user_id] ?? 'Friend',
+          position: [location.lat, location.lng],
+          role: location.user_id === userId ? 'self' : 'friend',
+          lastSeenAt: location.last_seen_at,
+        }
+
+        if (location.user_id === userId) {
+          setSelfMarker(marker)
+          if (!hasCenteredOnSelfRef.current) {
+            setCenter(marker.position)
+            hasCenteredOnSelfRef.current = true
+          }
+        } else {
+          nextFriendMarkers[location.user_id] = marker
+        }
+      }
+
+      setFriendMarkers(nextFriendMarkers)
+    }
+
+    void bootstrapSocialMap()
   }, [session?.user])
 
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setNowMs(Date.now())
+    }, 15_000)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!session?.user || !navigator.geolocation || !locationVisible) return
+
+    const userId = session.user.id
+    const watchId = navigator.geolocation.watchPosition(
+      async ({ coords }) => {
+        const position: LatLngTuple = [coords.latitude, coords.longitude]
+        const nowIso = new Date().toISOString()
+        const selfName = nameByUserId[userId] ?? session.user.email ?? 'You'
+        const marker: MarkerModel = {
+          id: userId,
+          name: selfName,
+          position,
+          role: 'self',
+          lastSeenAt: nowIso,
+        }
+
+        setSelfMarker(marker)
+        if (!hasCenteredOnSelfRef.current) {
+          setCenter(position)
+          hasCenteredOnSelfRef.current = true
+        }
+
+        const { error: upsertError } = await supabase.from('locations').upsert(
+          {
+            user_id: userId,
+            lat: coords.latitude,
+            lng: coords.longitude,
+            heading: coords.heading,
+            accuracy_meters: coords.accuracy,
+            last_seen_at: nowIso,
+          },
+          { onConflict: 'user_id' },
+        )
+        if (upsertError) {
+          setLocationStatus(upsertError.message)
+          return
+        }
+
+        setLocationStatus('Sharing location in realtime')
+        await ownChannelRef.current?.send({
+          type: 'broadcast',
+          event: 'location_update',
+          payload: {
+            userId,
+            lat: coords.latitude,
+            lng: coords.longitude,
+            lastSeenAt: nowIso,
+            visible: true,
+            name: selfName,
+          } satisfies BroadcastLocationPayload,
+        })
+      },
+      () => {
+        setLocationStatus('Unable to access GPS for live updates.')
+      },
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 8_000 },
+    )
+
+    return () => {
+      navigator.geolocation.clearWatch(watchId)
+    }
+  }, [session?.user, locationVisible, nameByUserId])
+
+  useEffect(() => {
+    if (!session?.user) return
+
+    const userId = session.user.id
+    const idsToSubscribe = [userId, ...friendIds]
+    const channels = idsToSubscribe.map((id) => {
+      const channel = supabase
+        .channel(`locatd:location:${id}`)
+        .on('broadcast', { event: 'location_update' }, ({ payload }) => {
+          const realtimePayload = payload as BroadcastLocationPayload
+          if (!realtimePayload.userId) return
+
+          if (realtimePayload.userId === userId) {
+            if (!realtimePayload.visible) return
+            setSelfMarker((previous) => ({
+              id: userId,
+              name: realtimePayload.name || previous?.name || 'You',
+              position: [realtimePayload.lat, realtimePayload.lng],
+              role: 'self',
+              lastSeenAt: realtimePayload.lastSeenAt,
+            }))
+            return
+          }
+
+          if (!friendIds.includes(realtimePayload.userId)) return
+          if (!realtimePayload.visible) {
+            setFriendMarkers((previous) => {
+              const next = { ...previous }
+              delete next[realtimePayload.userId]
+              return next
+            })
+            return
+          }
+
+          setFriendMarkers((previous) => ({
+            ...previous,
+            [realtimePayload.userId]: {
+              id: realtimePayload.userId,
+              name:
+                realtimePayload.name ||
+                nameByUserId[realtimePayload.userId] ||
+                'Friend',
+              position: [realtimePayload.lat, realtimePayload.lng],
+              role: 'friend',
+              lastSeenAt: realtimePayload.lastSeenAt,
+            },
+          }))
+        })
+        .subscribe()
+
+      if (id === userId) {
+        ownChannelRef.current = channel
+      }
+      return channel
+    })
+
+    return () => {
+      ownChannelRef.current = null
+      for (const channel of channels) {
+        void supabase.removeChannel(channel)
+      }
+    }
+  }, [session?.user, friendIds, nameByUserId])
+
   const markers = useMemo(
-    () => [TEST_MARKER, ...(selfMarker ? [selfMarker] : [])],
-    [selfMarker],
+    () => [TEST_MARKER, ...(selfMarker ? [selfMarker] : []), ...Object.values(friendMarkers)],
+    [selfMarker, friendMarkers],
   )
 
   const handleSignIn = async (event: FormEvent<HTMLFormElement>) => {
@@ -122,8 +377,52 @@ function App() {
         },
       },
     })
-    if (error) setAuthError(error.message)
+    if (error) {
+      const isRateLimited =
+        error.message.toLowerCase().includes('rate limit') || error.status === 429
+      setAuthError(
+        isRateLimited
+          ? 'Sign-up is temporarily rate-limited. Try again in a few minutes.'
+          : error.message,
+      )
+    }
     setAuthLoading(false)
+  }
+
+  const handleToggleLocationVisibility = async () => {
+    if (!session?.user) return
+
+    const userId = session.user.id
+    const nextVisible = !locationVisible
+    setLocationVisible(nextVisible)
+
+    const { error } = await supabase
+      .from('users')
+      .update({ location_visible: nextVisible })
+      .eq('id', userId)
+    if (error) {
+      setLocationVisible(!nextVisible)
+      setLocationStatus(error.message)
+      return
+    }
+
+    if (!nextVisible) {
+      setLocationStatus('Location hidden from friends')
+      await ownChannelRef.current?.send({
+        type: 'broadcast',
+        event: 'location_update',
+        payload: {
+          userId,
+          lat: selfMarker?.position[0] ?? DEFAULT_CENTER[0],
+          lng: selfMarker?.position[1] ?? DEFAULT_CENTER[1],
+          lastSeenAt: new Date().toISOString(),
+          visible: false,
+        } satisfies BroadcastLocationPayload,
+      })
+      return
+    }
+
+    setLocationStatus('Location sharing enabled')
   }
 
   const handleSearch = async (event: FormEvent<HTMLFormElement>) => {
@@ -156,6 +455,11 @@ function App() {
     }
   }
 
+  const handleSignOut = async () => {
+    await supabase.auth.signOut()
+    resetLocationState()
+  }
+
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-slate-900 text-slate-100">
       <MapContainer
@@ -175,7 +479,20 @@ function App() {
             position={marker.position}
             icon={createMarkerIcon(marker.role)}
           >
-            <Popup>{marker.name}</Popup>
+            <Popup>
+              <div className="space-y-1 text-sm">
+                <p className="font-medium">{marker.name}</p>
+                {marker.role !== 'test-user' ? (
+                  <p className="text-slate-500">
+                    {formatLastSeen(marker.lastSeenAt)}
+                    {marker.lastSeenAt &&
+                    nowMs - new Date(marker.lastSeenAt).getTime() > STALE_AFTER_MS
+                      ? ' (stale)'
+                      : ''}
+                  </p>
+                ) : null}
+              </div>
+            </Popup>
           </Marker>
         ))}
       </MapContainer>
@@ -210,7 +527,7 @@ function App() {
           <div className="mx-auto mb-4 h-1.5 w-10 rounded-full bg-slate-600 md:hidden" />
           <h1 className="text-lg font-semibold">locatd</h1>
           <p className="mt-1 text-xs text-slate-400">
-            Auth + map scaffold with Supabase and Leaflet.
+            Live location map with Supabase realtime.
           </p>
 
           {!isSupabaseConfigured ? (
@@ -227,8 +544,22 @@ function App() {
               </p>
               <button
                 type="button"
+                className={`w-full rounded-lg px-3 py-2 font-medium ${
+                  locationVisible
+                    ? 'bg-emerald-600 hover:bg-emerald-500'
+                    : 'bg-amber-600 hover:bg-amber-500'
+                }`}
+                onClick={() => void handleToggleLocationVisibility()}
+              >
+                {locationVisible ? 'Hide my location' : 'Share my location'}
+              </button>
+              {locationStatus ? (
+                <p className="text-xs text-slate-300">{locationStatus}</p>
+              ) : null}
+              <button
+                type="button"
                 className="w-full rounded-lg bg-slate-700 px-3 py-2 font-medium hover:bg-slate-600"
-                onClick={() => void supabase.auth.signOut()}
+                onClick={() => void handleSignOut()}
               >
                 Sign out
               </button>
